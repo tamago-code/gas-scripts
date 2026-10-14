@@ -2,6 +2,10 @@
 
 Google Apps Script (GAS) のスクリプト置き場。
 
+## GitHubリポジトリ
+
+https://github.com/tamago-code/gas-scripts.git
+
 ## Git運用ルール
 
 このプロジェクトでは、グローバル設定の「コミットは明示的に依頼された場合のみ」より以下を優先する。
