@@ -11,6 +11,7 @@
 const TODO_LABEL_NAME = '要処理';
 const DONE_LABEL_NAME = '処理済み';
 const MAIL_LOG_SHEET_NAME = 'メールログ';
+const MAIL_LOG_HEADERS = ['受信日時', '送信者', '件名', '分類', '要約', 'メッセージID'];
 const ERROR_LOG_SHEET_NAME = 'エラーログ';
 const EMAIL_CATEGORIES = ['クレーム', '質問', '注文', 'その他'];
 
@@ -74,14 +75,19 @@ function processPendingThreads_(startedAt) {
   const threads = GmailApp.search(`label:${TODO_LABEL_NAME} is:unread`, 0, MAX_THREADS_PER_RUN);
   if (threads.length === 0) return;
 
-  const todoLabel = GmailApp.getUserLabelByName(TODO_LABEL_NAME);
-  const doneLabel = GmailApp.getUserLabelByName(DONE_LABEL_NAME) || GmailApp.createLabel(DONE_LABEL_NAME);
-  const mailLog = getOrCreateSheet_(MAIL_LOG_SHEET_NAME, ['受信日時', '送信者', '件名', '分類', '要約']);
+  const mailLog = getOrCreateSheet_(MAIL_LOG_SHEET_NAME, MAIL_LOG_HEADERS);
+  const context = {
+    config,
+    mailLog,
+    loggedIds: getLoggedMessageIds_(mailLog),
+    todoLabel: GmailApp.getUserLabelByName(TODO_LABEL_NAME),
+    doneLabel: GmailApp.getUserLabelByName(DONE_LABEL_NAME) || GmailApp.createLabel(DONE_LABEL_NAME),
+  };
 
   for (const thread of threads) {
     if (Date.now() - startedAt > TIME_BUDGET_MS) break;
     try {
-      processThread_(thread, config, mailLog, todoLabel, doneLabel);
+      processThread_(thread, context);
     } catch (error) {
       appendErrorLog_(thread.getFirstMessageSubject(), error);
     }
@@ -89,27 +95,51 @@ function processPendingThreads_(startedAt) {
 }
 
 /**
- * スレッド内の未読メールを1通ずつ分類・記録・通知し、最後にラベルを付け替える
+ * スレッド内の未読メールを1通ずつ処理し、最後にラベルを付け替える
  */
-function processThread_(thread, config, mailLog, todoLabel, doneLabel) {
+function processThread_(thread, context) {
   const unreadMessages = thread.getMessages().filter(message => message.isUnread());
   if (unreadMessages.length === 0) return;
 
-  unreadMessages.forEach(message => {
-    const subject = message.getSubject() || '（件名なし）';
-    const result = classifyEmail_(config.apiKey, subject, message.getPlainBody());
-    appendRowAsText_(mailLog, [message.getDate(), message.getFrom(), subject, result.category, result.summary]);
+  unreadMessages
+    // 処理済みのメールは未読のまま残るため、同じスレッドに返信が届いて再び「要処理」になったときに二重に処理しない
+    .filter(message => !context.loggedIds.has(message.getId()))
+    .forEach(message => processMessage_(message, context));
 
-    try {
-      notifySlack_(config.webhookUrl, subject, result);
-    } catch (error) {
-      // メールログには記録済みのため、スレッドを再処理して記録が重複しないよう、通知の失敗だけを残して続行する
-      appendErrorLog_(subject, error);
-    }
-  });
+  thread.addLabel(context.doneLabel);
+  thread.removeLabel(context.todoLabel);
+}
 
-  thread.addLabel(doneLabel);
-  thread.removeLabel(todoLabel);
+/**
+ * メール1通を分類し、「メールログ」に記録して Slack に通知する
+ */
+function processMessage_(message, context) {
+  const subject = message.getSubject() || '（件名なし）';
+  const result = classifyEmail_(context.config.apiKey, subject, message.getPlainBody());
+  appendRowAsText_(context.mailLog, [
+    message.getDate(), message.getFrom(), subject, result.category, result.summary, message.getId(),
+  ]);
+  context.loggedIds.add(message.getId());
+
+  try {
+    notifySlack_(context.config.webhookUrl, subject, result);
+  } catch (error) {
+    // 記録済みのメールは再処理されないため、通知の失敗はエラーログに残して処理を続ける
+    appendErrorLog_(subject, error);
+  }
+}
+
+/**
+ * 「メールログ」に記録済みのメッセージ ID を取得する
+ */
+function getLoggedMessageIds_(mailLog) {
+  const lastRow = mailLog.getLastRow();
+  if (lastRow < 2) return new Set();
+
+  const idColumn = MAIL_LOG_HEADERS.indexOf('メッセージID') + 1;
+  const values = mailLog.getRange(2, idColumn, lastRow - 1, 1).getValues();
+  // 書き込み時に付けた先頭の ' が値に残っていても照合できるよう取り除く
+  return new Set(values.map(row => String(row[0]).replace(/^'/, '')));
 }
 
 /**
